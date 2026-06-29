@@ -10,4 +10,4 @@ opencv-python
 numpy
 transformers
 pillow
-fitz
+frontend
