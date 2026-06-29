@@ -4,11 +4,11 @@ import re
 import yaml
 import pytesseract
 import cv2
+import io
 import numpy as np
 from transformers import VisionEncoderDecoderModel, ViTImageProcessor, AutoTokenizer
 import torch
 from PIL import Image
-import os
 import logging
 import traceback
 import warnings
@@ -18,22 +18,23 @@ import argparse
 
 warnings.filterwarnings("ignore")
 
-with open(Path("config/config.yaml").resolve(), "r", encoding="utf-8") as f:
+_CONFIG_PATH = Path(__file__).parent / "config" / "config.yaml"
+with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
     config = yaml.safe_load(f)
 
 
 class PDFExtractor(ABC):
     """Abstract base class for PDF extraction."""
 
-    def __init__(self, pdf_path):
+    def __init__(self, pdf_path, output_dir=None):
         self.pdf_path = pdf_path
+        self.output_dir = Path(output_dir) if output_dir else Path(pdf_path).parent
         self.setup_logging()
 
     def setup_logging(self):
         """Set up logging configuration."""
-        log_dir = Path(__file__).parent / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_file = log_dir / f"{Path(__file__).stem}.log"
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        log_file = self.output_dir / f"{Path(self.pdf_path).stem}.log"
 
         logging.basicConfig(
             level=logging.INFO,
@@ -56,14 +57,20 @@ class MarkdownPDFExtractor(PDFExtractor):
 
     BULLET_POINTS = "•◦▪▫●○"
 
-    def __init__(self, pdf_path):
-        super().__init__(pdf_path)
+    def __init__(self, pdf_path, output_dir=None, skip_images=False):
+        super().__init__(pdf_path, output_dir)
         self.pdf_filename = Path(pdf_path).stem
-        Path(config["OUTPUT_DIR"]).mkdir(parents=True, exist_ok=True)
-        self.setup_image_captioning()
+        self.skip_images = skip_images
+        self.images_dir = self.output_dir / f"{self.pdf_filename}_images"
+        self.model = None
+        self.feature_extractor = None
+        self.tokenizer = None
+        self.device = None
 
-    def setup_image_captioning(self):
-        """Set up the image captioning model."""
+    def _ensure_captioning_model(self):
+        """Lazy-load the image captioning model on first use."""
+        if self.model is not None:
+            return True
         try:
             self.model = VisionEncoderDecoderModel.from_pretrained(
                 "nlpconnect/vit-gpt2-image-captioning"
@@ -77,16 +84,18 @@ class MarkdownPDFExtractor(PDFExtractor):
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             self.model.to(self.device)
             self.logger.info("Image captioning model set up successfully.")
+            return True
         except Exception as e:
             self.logger.error(f"Error setting up image captioning model: {e}")
             self.logger.exception(traceback.format_exc())
+            return False
 
     def extract(self):
         try:
             markdown_content, markdown_pages = self.extract_markdown()
             self.save_markdown(markdown_content)
             self.logger.info(
-                f"Markdown content has been saved to {Path(config['OUTPUT_DIR'])}/{self.pdf_filename}.md"
+                f"Markdown content has been saved to {self.output_dir}/{self.pdf_filename}.md"
             )
             return markdown_content, markdown_pages
 
@@ -112,27 +121,21 @@ class MarkdownPDFExtractor(PDFExtractor):
             for page_num, page in enumerate(doc):
                 self.logger.info(f"Processing page {page_num + 1}")
                 page_content = ""
-                blocks = page.get_text("dict")["blocks"]
-                page_height = page.rect.height
-                links = self.extract_links(page)
 
-                if len(page.get_images()) > 0 and len(page.get_images()) <= 128:
-                    for block in blocks:
-                        if block["type"] == 0:  # Text
-                            page_content += self.process_text_block(
-                                block,
-                                page_height,
-                                links,
-                                list_counter,
-                                in_code_block,
-                                code_block_content,
-                                code_block_lang,
-                                prev_line,
-                            )
-                        elif block["type"] == 1:  # Image
-                            page_content += self.process_image_block(page, block)
+                # Decide upfront whether this page has real extractable text.
+                # A scanned page will have essentially no text from fitz; a text
+                # PDF page will have plenty.  50 chars is conservative enough to
+                # avoid false-positives from page-number/header-only pages.
+                has_text = len(page.get_text().strip()) > 50
 
+                if not has_text and page.get_images():
+                    # Scanned page: render it and OCR for text content.
+                    page_content = self._ocr_full_page(page)
                 else:
+                    blocks = page.get_text("dict")["blocks"]
+                    page_height = page.rect.height
+                    links = self.extract_links(page)
+
                     for block in blocks:
                         if block["type"] == 0:  # Text
                             page_content += self.process_text_block(
@@ -145,6 +148,8 @@ class MarkdownPDFExtractor(PDFExtractor):
                                 code_block_lang,
                                 prev_line,
                             )
+                        elif block["type"] == 1 and not self.skip_images:
+                            page_content += self.process_image_block(page, block)
 
                 # Insert tables at their approximate positions
                 while (
@@ -178,7 +183,8 @@ class MarkdownPDFExtractor(PDFExtractor):
                     if len(page_tables) > 128:
                         continue
                     for table in page_tables:
-                        tables.append({"page": page_number, "content": table})
+                        if self._is_data_table(table):
+                            tables.append({"page": page_number, "content": table})
             self.logger.info(f"Extracted {len(tables)} tables from the PDF.")
         except Exception as e:
             self.logger.error(f"Error extracting tables: {e}")
@@ -217,56 +223,94 @@ class MarkdownPDFExtractor(PDFExtractor):
             self.logger.exception(traceback.format_exc())
             return ""
 
-    def perform_ocr(self, image):
-        """Perform OCR on the given image."""
+    def _ocr_full_page(self, page):
+        """Render a scanned page at 2x and return its full OCR text as markdown."""
         try:
-            opencv_image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-            ocr_result = pytesseract.image_to_data(
-                opencv_image, output_type=pytesseract.Output.DICT
-            )
-
-            result = ""
-            for word in ocr_result["text"]:
-                if word.strip() != "":
-                    result += word + " "
-
-                if len(result) > 30:
-                    break
-
-            return result.strip()
+            mat = fitz.Matrix(2.0, 2.0)
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            opencv_image = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+            text = pytesseract.image_to_string(opencv_image)
+            self.logger.info(f"OCR page {page.number + 1}: {len(text)} chars extracted")
+            return text + "\n"
         except Exception as e:
-            self.logger.error(f"Error performing OCR: {e}")
+            self.logger.error(f"Error OCR-ing page {page.number + 1}: {e}")
             self.logger.exception(traceback.format_exc())
             return ""
 
-    def caption_image(self, image):
-        """Generate a caption for the given image."""
+    def _neural_caption(self, image):
+        """Generate a caption using the VIT-GPT2 model. Returns empty string on failure."""
         try:
-            ocr_text = self.perform_ocr(image)
-            if ocr_text:
-                return ocr_text
-
-            # Convert image to RGB if it's not already
-            if image.mode != "RGB":
-                image = image.convert("RGB")
-
-            # Ensure the image is in the correct shape
-            image = np.array(image).transpose(2, 0, 1)  # Convert to (C, H, W) format
-
-            inputs = self.feature_extractor(images=image, return_tensors="pt").to(
-                self.device
-            )
-            pixel_values = inputs.pixel_values
-
-            generated_ids = self.model.generate(pixel_values, max_length=30)
-            generated_caption = self.tokenizer.batch_decode(
-                generated_ids, skip_special_tokens=True
-            )[0]
-            return generated_caption.strip()
+            if not self._ensure_captioning_model():
+                return ""
+            img = image.convert("RGB") if image.mode != "RGB" else image
+            arr = np.array(img).transpose(2, 0, 1)
+            inputs = self.feature_extractor(images=arr, return_tensors="pt").to(self.device)
+            generated_ids = self.model.generate(inputs.pixel_values, max_length=30)
+            return self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
         except Exception as e:
-            self.logger.error(f"Error captioning image: {e}")
+            self.logger.error(f"Error generating neural caption: {e}")
             self.logger.exception(traceback.format_exc())
             return ""
+
+    def _merge_letterspaced_spans(self, spans):
+        """
+        Merge consecutive all-uppercase spans whose horizontal gap is smaller
+        than a word space.  Fixes three related rendering artifacts:
+          1. Tracked/letter-spaced bold headings: **E** **DITION** → **EDITION**
+          2. Small-caps section titles: W HAT → WHAT
+          3. Heading lines where every letter is its own span: H  OW → HOW
+
+        Word space in most fonts is ~1/3 em; we use 0.35× the larger font size
+        as the threshold.  Spans with a gap below that are within the same word.
+        """
+        if len(spans) <= 1:
+            return spans
+
+        result = []
+        current = dict(spans[0])
+
+        for nxt in spans[1:]:
+            c_text = current["text"]
+            n_text = nxt["text"]
+
+            c_upper = bool(c_text.strip()) and c_text == c_text.upper()
+            n_upper = bool(n_text.strip()) and n_text == n_text.upper()
+
+            if c_upper and n_upper:
+                gap = nxt["bbox"][0] - current["bbox"][2]
+                word_space = max(current["size"], nxt["size"]) * 0.35
+                if gap < word_space:
+                    current = {
+                        **current,
+                        "text": c_text + n_text,
+                        "bbox": (
+                            current["bbox"][0],
+                            min(current["bbox"][1], nxt["bbox"][1]),
+                            nxt["bbox"][2],
+                            max(current["bbox"][3], nxt["bbox"][3]),
+                        ),
+                    }
+                    continue
+
+            result.append(current)
+            current = dict(nxt)
+
+        result.append(current)
+        return result
+
+    def _is_data_table(self, table):
+        """
+        Return True only when the table looks like real tabular data.
+        pdfplumber misidentifies multi-column body text as tables; those
+        produce cells with hundreds of words.  Any cell exceeding 200 chars
+        is a strong signal that this is a column layout, not a table.
+        """
+        for row in table:
+            for cell in row:
+                if cell and len(str(cell)) > 200:
+                    return False
+        return True
 
     def clean_text(self, text):
         """Clean the given text by removing extra spaces."""
@@ -431,9 +475,10 @@ class MarkdownPDFExtractor(PDFExtractor):
 
             for line in block["lines"]:
                 line_text = ""
-                curr_font_size = [span["size"] for span in line["spans"]]
+                merged_spans = self._merge_letterspaced_spans(line["spans"])
+                curr_font_size = [span["size"] for span in merged_spans]
 
-                for span in line["spans"]:
+                for span in merged_spans:
                     text = span["text"]
                     font_size = span["size"]
                     flags = span["flags"]
@@ -547,31 +592,45 @@ class MarkdownPDFExtractor(PDFExtractor):
     def process_image_block(self, page, block):
         """Process an image block and convert it to markdown."""
         try:
-            image_rect = block["bbox"]
-            zoom_x = 2.0  # horizontal zoom
-            zoom_y = 2.0  # vertical zoom
-            mat = fitz.Matrix(zoom_x, zoom_y)  # zoom factor 2 in each dimension
-            pix = page.get_pixmap(clip=image_rect, matrix=mat, alpha=False)
-            image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            # Pull the image bytes that fitz already decoded from the PDF stream.
+            # This avoids re-rendering the page region through a pixmap.
+            image = None
+            raw = block.get("image")
+            if raw:
+                try:
+                    image = Image.open(io.BytesIO(raw))
+                    if image.mode not in ("RGB", "RGBA", "L", "P"):
+                        image = image.convert("RGB")
+                except Exception:
+                    image = None
+
+            if image is None:
+                # Fallback: render the page region (e.g. for vector graphics).
+                mat = fitz.Matrix(2.0, 2.0)
+                pix = page.get_pixmap(clip=fitz.Rect(block["bbox"]), matrix=mat, alpha=False)
+                image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
 
             if image.width < 20 or image.height < 20:
                 return ""
 
+            self.images_dir.mkdir(parents=True, exist_ok=True)
             image_filename = (
                 f"{self.pdf_filename}_image_{int(page.number)+1}_{block['number']}.png"
             )
-            image_path = (
-                Path(config["OUTPUT_DIR"]) / image_filename
-            )  # Convert to Path object
-            image.save(image_path, "PNG", optimize=True, quality=95)
+            image_path = self.images_dir / image_filename
+            save_img = image.convert("RGB") if image.mode not in ("RGB", "L") else image
+            save_img.save(image_path, "PNG", optimize=True)
 
-            caption = self.caption_image(image)
-            if not caption:
-                caption = (
-                    f"{self.pdf_filename}_image_{int(page.number)+1}_{block['number']}"
-                )
+            # For embedded images in a text PDF, the image is a figure/diagram —
+            # OCR on it produces garbage.  Use the neural captioner instead, and
+            # only fall back to OCR when the page itself was identified as a scan
+            # (that path is handled by _ocr_full_page, not here).
+            caption = self._neural_caption(image) or (
+                f"{self.pdf_filename}_image_{int(page.number)+1}_{block['number']}"
+            )
 
-            return f"![{caption}]({image_path})\n\n"  # image_path is now a Path object
+            rel_path = image_path.relative_to(self.output_dir)
+            return f"![{caption}]({rel_path})\n\n"
         except Exception as e:
             self.logger.error(f"Error processing image block: {e}")
             self.logger.exception(traceback.format_exc())
@@ -610,6 +669,31 @@ class MarkdownPDFExtractor(PDFExtractor):
                 r"\s*(---\n)+", "\n\n---\n", markdown_content
             )  # Remove duplicate horizontal lines
 
+            # Safety net for bold letter-spaced fragments the span merger missed.
+            # A single uppercase char in its own **bold** span almost certainly
+            # belongs to the next all-caps bold word (e.g. **E** **DITION**).
+            # Apply repeatedly until the pattern is gone.
+            bold_frag = re.compile(r'\*\*([A-Z0-9])\*\* \*\*([A-Z][A-Z0-9]*)\*\*')
+            while bold_frag.search(markdown_content):
+                markdown_content = bold_frag.sub(r'**\1\2**', markdown_content)
+
+            # Safety net for small-caps headers the span merger missed.
+            # Restrict to heading lines (start with #) to avoid false merges
+            # in body text where a single capital might be a word on its own.
+            def fix_smallcaps_heading(m):
+                hashes = m.group(1)
+                text = m.group(2)
+                # Merge: single uppercase letter + space + uppercase word(s)
+                fixed = re.sub(r'\b([A-Z]) ([A-Z]{2,})\b', r'\1\2', text)
+                return hashes + fixed
+
+            markdown_content = re.sub(
+                r'^(#{1,6} )(.+)$',
+                fix_smallcaps_heading,
+                markdown_content,
+                flags=re.MULTILINE,
+            )
+
             def remove_middle_headers(match):
                 line = match.group(0)
                 # Keep the initial header and remove all subsequent '#' characters
@@ -635,12 +719,9 @@ class MarkdownPDFExtractor(PDFExtractor):
     def save_markdown(self, markdown_content):
         """Save the markdown content to a file."""
         try:
-            os.makedirs(Path(config["OUTPUT_DIR"]), exist_ok=True)
-            with open(
-                f"{Path(config['OUTPUT_DIR'])}/{self.pdf_filename}.md",
-                "w",
-                encoding="utf-8",
-            ) as f:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            out_file = self.output_dir / f"{self.pdf_filename}.md"
+            with open(out_file, "w", encoding="utf-8") as f:
                 f.write(markdown_content)
             self.logger.info("Markdown content saved successfully.")
         except Exception as e:
@@ -653,9 +734,24 @@ def main():
         description="Extract markdown-formatted content from a PDF file."
     )
     parser.add_argument("--pdf_path", help="Path to the input PDF file", required=True)
+    parser.add_argument(
+        "--output_dir",
+        help="Directory for output files (default: same directory as the PDF)",
+        default=None,
+    )
+    parser.add_argument(
+        "--skip_images",
+        help="Skip image extraction and captioning (faster for text-only PDFs)",
+        action="store_true",
+        default=False,
+    )
     args = parser.parse_args()
 
-    extractor = MarkdownPDFExtractor(args.pdf_path)
+    extractor = MarkdownPDFExtractor(
+        args.pdf_path,
+        output_dir=args.output_dir,
+        skip_images=args.skip_images,
+    )
     markdown_pages = extractor.extract()
     return markdown_pages
 
